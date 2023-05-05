@@ -755,6 +755,8 @@ def export(
     if pre_autograd:
         assert aten_graph, "pre_autograd=True can only be used when aten_graph=True"
     f = innermost_fn(f)
+    call_to_inspect = f.forward if isinstance(f, torch.nn.Module) else f
+    original_signature = inspect.signature(call_to_inspect)
 
     if functionalize and not aten_graph:
         raise UserError(
@@ -865,7 +867,7 @@ def export(
         dim_constraints.solve()
         log.warning(
             "Summary of dimension constraints:%s",
-            dim_constraints.prettify_results(inspect.signature(f)),
+            dim_constraints.prettify_results(original_signature),
         )
 
     matched_input_elements_positions = produce_matching(flat_args, graph_captured_input)
@@ -1024,10 +1026,7 @@ def export(
 
     # Make dynamo graph to have same input/output spec as user code
     def argument_names(f: Callable[..., Any], *args, **kwargs) -> List[str]:
-        call_to_inspect = f.forward if isinstance(f, torch.nn.Module) else f
-
-        sig = inspect.signature(call_to_inspect)
-        fullargspec = signature_to_fullargspec(sig)
+        fullargspec = signature_to_fullargspec(original_signature)
 
         # 1. Map `args` 1-to-1 to positional arguments in original signature.
         input_strs = fullargspec.args[: len(args)]
