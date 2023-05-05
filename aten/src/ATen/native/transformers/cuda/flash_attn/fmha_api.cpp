@@ -34,7 +34,6 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/NativeFunctions.h>
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
-#include <ATen/ops/scalar_tensor.h>
 
 #include <ATen/native/transformers/cuda/flash_attn/fmha.h>
 #include <ATen/native/transformers/cuda/flash_attn/fmha_api.h>
@@ -326,8 +325,8 @@ mha_fwd(const at::Tensor &q,         // total_q x num_heads x head_size, total_q
         at::PhiloxCudaState philox_state = gen->philox_cuda_state(counter_offset);
         if (at::cuda::currentStreamCaptureStatus() == at::cuda::CaptureStatus::None) {
           auto [seed, offset] = at::cuda::philox::unpack(philox_state);
-          seed_t = at::scalar_tensor(at::Scalar(static_cast<int64_t>(seed)), at::dtype(at::kLong));
-          offset_t = at::scalar_tensor(at::Scalar(static_cast<int64_t>(offset)), at::dtype(at::kLong));
+          seed_t = at::tensor({static_cast<int64_t>(seed)}, at::dtype(at::kLong));
+          offset_t = at::tensor({static_cast<int64_t>(offset)}, at::dtype(at::kLong));
         } else {
           seed_t = at::empty({}, at::dtype(at::kLong).device(at::kCUDA));
           offset_t = at::empty({}, at::dtype(at::kLong).device(at::kCUDA));
