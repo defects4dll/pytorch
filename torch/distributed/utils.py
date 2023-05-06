@@ -215,6 +215,7 @@ def _sync_module_states(
     broadcast_bucket_size,
     src,
     params_and_buffers_to_ignore,
+    broadcast_buffers = True,
 ):
     """
     Syncs ``module``'s parameters and buffers state so that all ranks contain
@@ -227,9 +228,10 @@ def _sync_module_states(
         if name not in params_and_buffers_to_ignore:
             module_states.append(param.detach())
 
-    for name, buffer in module.named_buffers():
-        if name not in params_and_buffers_to_ignore:
-            module_states.append(buffer.detach())
+    if broadcast_buffers:
+        for name, buffer in module.named_buffers():
+            if name not in params_and_buffers_to_ignore:
+                module_states.append(buffer.detach())
 
     _sync_params_and_buffers(
         process_group,
