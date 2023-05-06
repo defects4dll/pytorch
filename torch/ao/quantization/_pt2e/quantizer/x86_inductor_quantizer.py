@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import copy
 import functools
+import operator
 from .quantizer import (
     OperatorConfig,
     OperatorPatternType,
@@ -47,6 +48,25 @@ def supported_quantized_operators() -> Dict[str, List[OperatorPatternType]]:
         "conv2d": [
             [torch.nn.Conv2d],
             [F.conv2d],
+            # Conv ReLU
+            [torch.nn.Conv2d, torch.nn.ReLU],
+            [torch.nn.Conv2d, F.relu],
+            [F.conv2d, torch.nn.ReLU],
+            [F.conv2d, F.relu],
+            # Conv Add
+            [torch.nn.Conv2d, torch.add],
+            [torch.nn.Conv2d, operator.add],
+            [F.conv2d, torch.add],
+            [F.conv2d, operator.add],
+            # Conv Add ReLU
+            [torch.nn.Conv2d, torch.add, torch.nn.ReLU],
+            [torch.nn.Conv2d, torch.add, F.relu],
+            [torch.nn.Conv2d, operator.add, torch.nn.ReLU],
+            [torch.nn.Conv2d, operator.add, F.relu],
+            [F.conv2d, torch.add, torch.nn.ReLU],
+            [F.conv2d, torch.add, F.relu],
+            [F.conv2d, operator.add, torch.nn.ReLU],
+            [F.conv2d, operator.add, F.relu],
         ],
     }
     return copy.deepcopy(supported_operators)
@@ -155,9 +175,145 @@ class X86InductorQuantizer(Quantizer):
         for node in reversed(model.graph.nodes):
             # one improvement is to register node annotators for each
             # supported op type.
+            self._annotate_conv2d_binary_unary(node, config)
+            self._annotate_conv2d_binary(node, config)
+            self._annotate_conv2d_unary(node, config)
             self._annotate_conv2d(node, config)
-
         return model
+
+    def _annotate_conv2d_binary_unary(self, node: Node, quantization_config: QuantizationConfig) -> None:
+        # Conv2d + add + unary op
+        supported_unary_node = [torch.ops.aten.relu_.default, torch.ops.aten.relu.default]
+        if node.op != "call_function" or node.target not in supported_unary_node:
+            return
+        unary_node = node
+        assert isinstance(unary_node, Node)
+        binary_node = unary_node.args[0]
+        assert isinstance(binary_node, Node)
+        supported_binary_node = [torch.ops.aten.add_.Tensor, torch.ops.aten.add.Tensor]
+        if binary_node.op != "call_function" or binary_node.target not in supported_binary_node:
+            return
+        conv_node_idx = None
+        extra_input_node_idx = None
+        if (binary_node.args[0].op == "call_function") and (
+            binary_node.args[0].target == torch.ops.aten.convolution.default
+        ):
+            conv_node_idx = 0
+            extra_input_node_idx = 1
+        elif (binary_node.args[1].op == "call_function") and (
+            binary_node.args[1].target == torch.ops.aten.convolution.default
+        ):
+            conv_node_idx = 1
+            extra_input_node_idx = 0
+        if (conv_node_idx is None) or (extra_input_node_idx is None):
+            return
+
+        conv_node = binary_node.args[conv_node_idx]
+        assert isinstance(conv_node, Node)
+        if conv_node.op != "call_function" or conv_node.target != torch.ops.aten.convolution.default:
+            # No conv node found to be fused with add
+            return
+        if _is_annotated([unary_node, binary_node, conv_node]):
+            return
+
+        conv_node.meta["target_dtype_info"] = {
+            "input_act_obs_or_fq_ctr": get_act_obs_or_fq_ctr(quantization_config),
+            "weight_obs_or_fq_ctr": get_weight_obs_or_fq_ctr(quantization_config),
+            "bias_obs_or_fq_ctr": get_bias_obs_or_fq_ctr(quantization_config),
+            # TODO: validation of weight_index must be set if weight_obs_or_fq_ctr is set
+            "weight_index": 1,
+            # TODO: validation of bias_index must be set if bias_obs_or_fq_ctr is set
+            "bias_index": 2,
+            "_annotated": True,
+        }
+        # TODO(Leslie) Need to insert observer for the extra input node
+        # Maybe use "args_act_index"
+        binary_node.meta["target_dtype_info"] = {
+            "input_act_obs_or_fq_ctr": get_act_obs_or_fq_ctr(quantization_config),
+            "_annotated": True,
+            "args_act_index": [extra_input_node_idx],
+        }
+        unary_node.meta["target_dtype_info"] = {
+            "output_act_obs_or_fq_ctr": get_act_obs_or_fq_ctr(quantization_config),
+            "_annotated": True,
+        }
+
+    def _annotate_conv2d_binary(self, node: Node, quantization_config: QuantizationConfig) -> None:
+        # Conv2d + add
+        supported_binary_node = [torch.ops.aten.add_.Tensor, torch.ops.aten.add.Tensor]
+        if node.op != "call_function" or node.target not in supported_binary_node:
+            return
+        binary_node = node
+        assert isinstance(binary_node, Node)
+
+        conv_node_idx = None
+        extra_input_node_idx = None
+        if (binary_node.args[0].op == "call_function") and (
+            binary_node.args[0].target == torch.ops.aten.convolution.default
+        ):
+            conv_node_idx = 0
+            extra_input_node_idx = 1
+        elif (binary_node.args[1].op == "call_function") and (
+            binary_node.args[1].target == torch.ops.aten.convolution.default
+        ):
+            conv_node_idx = 1
+            extra_input_node_idx = 0
+        if (conv_node_idx is None) or (extra_input_node_idx is None):
+            return
+
+        conv_node = binary_node.args[conv_node_idx]
+        assert isinstance(conv_node, Node)
+        if conv_node.op != "call_function" or conv_node.target != torch.ops.aten.convolution.default:
+            # No conv node found to be fused with add
+            return
+        if _is_annotated([binary_node, conv_node]):
+            return
+
+        conv_node.meta["target_dtype_info"] = {
+            "input_act_obs_or_fq_ctr": get_act_obs_or_fq_ctr(quantization_config),
+            "weight_obs_or_fq_ctr": get_weight_obs_or_fq_ctr(quantization_config),
+            "bias_obs_or_fq_ctr": get_bias_obs_or_fq_ctr(quantization_config),
+            # TODO: validation of weight_index must be set if weight_obs_or_fq_ctr is set
+            "weight_index": 1,
+            # TODO: validation of bias_index must be set if bias_obs_or_fq_ctr is set
+            "bias_index": 2,
+            "_annotated": True,
+        }
+        # TODO(Leslie) Need to insert observer for the extra input node
+        # Maybe use "args_act_index"
+        binary_node.meta["target_dtype_info"] = {
+            "input_act_obs_or_fq_ctr": get_act_obs_or_fq_ctr(quantization_config),
+            "output_act_obs_or_fq_ctr": get_act_obs_or_fq_ctr(quantization_config),
+            "_annotated": True,
+            "args_act_index": [extra_input_node_idx],
+        }
+
+    def _annotate_conv2d_unary(self, node: Node, quantization_config: QuantizationConfig) -> None:
+        supported_unary_node = [torch.ops.aten.relu_.default, torch.ops.aten.relu.default]
+        if node.op != "call_function" or node.target not in supported_unary_node:
+            return
+        unary_node = node
+        conv_node = unary_node.args[0]
+        assert isinstance(conv_node, Node)
+        if conv_node.op != "call_function" or conv_node.target != torch.ops.aten.convolution.default:
+            return
+        if _is_annotated([unary_node, conv_node]):
+            return
+
+        conv_node.meta["target_dtype_info"] = {
+            "input_act_obs_or_fq_ctr": get_act_obs_or_fq_ctr(quantization_config),
+            "weight_obs_or_fq_ctr": get_weight_obs_or_fq_ctr(quantization_config),
+            "bias_obs_or_fq_ctr": get_bias_obs_or_fq_ctr(quantization_config),
+            # TODO: validation of weight_index must be set if weight_obs_or_fq_ctr is set
+            "weight_index": 1,
+            # TODO: validation of bias_index must be set if bias_obs_or_fq_ctr is set
+            "bias_index": 2,
+            "_annotated": True,
+        }
+        unary_node.meta["target_dtype_info"] = {
+            "output_act_obs_or_fq_ctr": get_act_obs_or_fq_ctr(quantization_config),
+            "_annotated": True,
+        }
 
     def _annotate_conv2d(self, node: Node, quantization_config: QuantizationConfig) -> None:
         conv_node = node
